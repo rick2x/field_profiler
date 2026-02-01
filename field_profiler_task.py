@@ -255,7 +255,7 @@ class FieldProfilerTask(QgsTask):
 
                 count += 1
                 if count % 1000 == 0:
-                     self.setProgress((count / total_count) * 100 if total_count > 0 else 0)
+                     self.setProgress(int((count / total_count) * 100) if total_count > 0 else 0)
             
             # 4. Finalize Analysis (Calculate Stats)
             self.setProgress(90)
@@ -311,21 +311,26 @@ class FieldProfilerTask(QgsTask):
                 self.results[fname] = field_res
 
             # Calculate Global Correlation
-            if self.row_reservoir and self.row_reservoir.reservoir:
-                try:
-                    # Convert to numpy array (N samples x M fields)
-                    data_matrix = numpy.array(self.row_reservoir.reservoir)
-                    if data_matrix.size > 0:
-                        # Rowvar=False because rows are samples, cols are fields
-                        corr_matrix = numpy.corrcoef(data_matrix, rowvar=False)
-                        # Handle case where corrcoef returns scalar if only 2 vars? No, always matrix if multidim input?
-                        # If 1 var, scalar. Checked > 1 above.
-                        self.results['_global_correlation'] = {
-                            'fields': self.numeric_fields_for_corr,
-                            'matrix': corr_matrix.tolist()
-                        }
-                except Exception as e:
-                    self.results['_global_correlation'] = {'Error': str(e)}
+            if self.row_reservoir: 
+                if self.row_reservoir.reservoir:
+                    try:
+                        # Convert to numpy array (N samples x M fields)
+                        data_matrix = numpy.array(self.row_reservoir.reservoir)
+                        if data_matrix.size > 0:
+                            # Rowvar=False because rows are samples, cols are fields
+                            corr_matrix = numpy.corrcoef(data_matrix, rowvar=False)
+                            self.results['_global_correlation'] = {
+                                'fields': self.numeric_fields_for_corr,
+                                'matrix': corr_matrix.tolist()
+                            }
+                        else:
+                             self.results['_global_correlation'] = {'Error': 'No valid overlapping numeric data found for correlation.'}
+                    except Exception as e:
+                        self.results['_global_correlation'] = {'Error': str(e)}
+                else:
+                    self.results['_global_correlation'] = {'Error': 'No shared valid (non-null) data found between selected numeric fields.'}
+            elif len(self.numeric_fields_for_corr) < 2:
+                 self.results['_global_correlation'] = {'Error': 'Correlation requires at least 2 numeric fields.'}
 
             # Finalize Validation Results
             if self.validation_rules_str:
@@ -423,12 +428,16 @@ class FieldProfilerTask(QgsTask):
         # Histogram data for charts
         if len(data_sample) > 0:
             try:
-                # Use Freedman-Diaconis rule for bin count if possible, otherwise default
-                # We already calculated optimal bins in original code, let's reuse logic or simple auto
-                hist, bin_edges = numpy.histogram(data_sample, bins='auto')
-                res['_histogram_data'] = (hist.tolist(), bin_edges.tolist())
-            except Exception:
-                pass
+                # Filter Infs as well
+                data_clean = data_sample[~numpy.isinf(data_sample)]
+                if len(data_clean) > 0:
+                    hist, bin_edges = numpy.histogram(data_clean, bins='auto')
+                    res['_histogram_data'] = (hist.tolist(), bin_edges.tolist())
+                else:
+                     QgsMessageLog.logMessage(f"Histogram skipped: All values are Inf or NaN", "FieldProfiler", Qgis.Warning)
+            except Exception as e:
+                QgsMessageLog.logMessage(f"Histogram error: {e}", "FieldProfiler", Qgis.Critical)
+
 
         return res
 
