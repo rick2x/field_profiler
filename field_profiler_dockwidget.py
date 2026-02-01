@@ -1075,7 +1075,9 @@ class FieldProfilerDockWidget(QDockWidget):
         return results
 
     def _on_cell_double_clicked(self, row, column):
-        if column == 0: return # Clicked on the statistic name column itself
+        if column == 0:
+            self.iface.messageBar().pushMessage(self.tr("Selection Info"), self.tr("Please double-click on a specific field value (cells to the right) to select features."), level=Qgis.Info)
+            return
 
         current_layer = self.layerComboBox.currentLayer()
         if not current_layer or not isinstance(current_layer, QgsVectorLayer):
@@ -1180,11 +1182,14 @@ class FieldProfilerDockWidget(QDockWidget):
             else:
                 self.iface.messageBar().pushMessage(self.tr("Warning"), self.tr("Cannot select unique value of type: {0}. Selection for this type is not implemented.").format(type(actual_first_value).__name__), level=Qgis.Warning); return
         
+        else:
+             self.iface.messageBar().pushMessage(self.tr("Selection Info"), self.tr("Feature selection is not available for '{0}'.").format(self.tr(original_statistic_key)), level=Qgis.Info)
+             return
+
         if expression:
             self._select_features_by_expression(current_layer, field_name_for_selection, expression)
         elif ids_to_select_directly is not None: # Check for not None, as empty list is valid
             self._select_features_by_ids(current_layer, field_name_for_selection, ids_to_select_directly)
-        # else: no action defined for this cell/statistic
 
 
     def _select_features_by_expression(self, layer, field_name, expression_string):
