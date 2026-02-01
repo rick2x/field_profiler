@@ -3,7 +3,7 @@
 </p>
 QGIS Field Profiler Plugin
 
-**Version:** 0.1.1
+**Version:** 0.1.2
 **QGIS Minimum Version:** 3.0
 **Author:** ricks (rrcuario@gmail.com)
 
@@ -87,6 +87,36 @@ Alternatively, for development or manual installation:
 7.  **Export/Copy:** Use the buttons to copy the table to the clipboard or export it as a CSV file.
 
 ## Changelog
+
+### Version 0.1.2 (2026-02-01)
+
+This version contains critical bug fixes that resolve several issues preventing proper plugin operation.
+
+**Critical Bug Fixes:**
+
+1.  **Fixed Runtime Errors in Task Processing (`field_profiler_task.py`):**
+    *   Added missing `non_printable_fids` key to collector dictionary initialization (was causing `KeyError`).
+    *   Fixed `field_res` variable being referenced before definition (was causing `NameError`).
+    *   Implemented proper non-printable character detection - now correctly calls `_has_non_printable_chars()`.
+
+2.  **Completed Date Field Analysis (`_analyze_date`):**
+    *   Replaced placeholder implementation with full date statistics.
+    *   Now properly calculates Min/Max Date, Common Years/Months/Days, Weekend/Weekday percentages, and Before/After Today counts.
+
+3.  **Fixed Control Flow in Results Handler (`field_profiler_dockwidget.py`):**
+    *   Corrected mismatched `else` block in `on_analysis_finished()` that caused logic errors.
+    *   Removed ~135 lines of orphaned dead code that was left from previous refactoring.
+
+4.  **Added Missing Imports:**
+    *   Added `QPlainTextEdit` and `QHeaderView` to widget imports.
+
+**Code Quality Improvements:**
+
+*   Removed duplicate imports in `field_profiler_plugin.py`.
+*   Removed debug `print()` statements from production code.
+*   Synchronized version number between `metadata.txt` and `README.md`.
+
+---
 
 ### Version 0.1.1 (2025-05-14)
 

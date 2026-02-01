@@ -2,7 +2,7 @@
 name=Field Profiler
 qgisMinimumVersion=3.0
 description=Analyzes and summarizes attribute field values for selected layers.
-version=0.1
+version=0.1.2
 author=ricks
 email=rrcuario@gmail.com
 about=The Field Profiler plugin provides an advanced analysis of attribute data for vector layers in QGIS.

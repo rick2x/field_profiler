@@ -10,7 +10,7 @@ from qgis.PyQt.QtWidgets import (QWidget, QVBoxLayout, QGroupBox, QLabel, QCheck
                                  QListWidget, QPushButton, QDockWidget, QTableWidget,
                                  QAbstractItemView, QTableWidgetItem, QApplication,
                                  QFileDialog, QHBoxLayout, QSizePolicy, QProgressBar,
-                                 QSpinBox, QFormLayout)
+                                 QSpinBox, QFormLayout, QPlainTextEdit, QHeaderView)
 from qgis.gui import QgsMapLayerComboBox
 from qgis.core import (QgsProject, QgsVectorLayer, QgsField, Qgis,
                        QgsStatisticalSummary, QgsMapLayerProxyModel, QgsFeatureRequest,
@@ -19,7 +19,10 @@ from qgis.core import (QgsProject, QgsVectorLayer, QgsField, Qgis,
 import statistics
 from collections import Counter, OrderedDict
 import numpy # Keep this import
-from datetime import datetime # Added for analyze_date_field_enhanced
+from datetime import datetime
+from .field_profiler_task import FieldProfilerTask
+from .report_generator import ReportGenerator
+from qgis.core import QgsApplication
 
 
 SCIPY_AVAILABLE = False
@@ -28,6 +31,27 @@ try:
     SCIPY_AVAILABLE = True
 except ImportError:
     scipy_stats = None # So we can check against it
+
+MATPLOTLIB_AVAILABLE = False
+try:
+    import matplotlib
+    matplotlib.use('Qt5Agg') # Or QtAgg depending on environment, try safe default or check
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    try:
+         # Try QtAgg for newer matplotlib/PyQt6 if Qt5Agg fails
+        import matplotlib
+        matplotlib.use('QtAgg')
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
+        import matplotlib.pyplot as plt
+        MATPLOTLIB_AVAILABLE = True
+    except ImportError:
+        pass
+
 
 STOP_WORDS = set([
     'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'has', 'he',
@@ -92,6 +116,7 @@ class FieldProfilerDockWidget(QDockWidget):
         self.analyzeButton.clicked.connect(self.run_analysis)
         self.copyButton.clicked.connect(self.copy_results_to_clipboard)
         self.exportButton.clicked.connect(self.export_results_to_csv)
+        self.exportHtmlButton.clicked.connect(self.export_results_to_html)
         self.resultsTableWidget.cellDoubleClicked.connect(self._on_cell_double_clicked)
 
         self.populate_fields(self.layerComboBox.currentLayer())
@@ -101,6 +126,9 @@ class FieldProfilerDockWidget(QDockWidget):
                 self.tr("Scipy library not found. Advanced numeric statistics (Skewness, Kurtosis, Normality) will be unavailable."),
                 level=Qgis.Warning, duration=10
             )
+
+        self.current_task = None
+
         
     def tr(self, message):
         return QtCore.QCoreApplication.translate("FieldProfilerDockWidget", message)
@@ -255,26 +283,95 @@ class FieldProfilerDockWidget(QDockWidget):
         self.progressBar.setTextVisible(True); self.progressBar.setVisible(False)
         main_input_layout.addWidget(self.progressBar)
         
+        # Validation Rules UI
+        self.validation_group = QGroupBox(self.tr("Validation Rules (Optional)"))
+        self.validation_group.setCheckable(True)
+        self.validation_group.setChecked(False)
+        val_layout = QVBoxLayout()
+        val_lbl = QLabel(self.tr("Enter QGIS Expressions (one per line). Example: \"age\" > 20"))
+        val_layout.addWidget(val_lbl)
+        self.validation_rules_edit = QPlainTextEdit()
+        self.validation_rules_edit.setPlaceholderText("\"field_a\" > 0\nlength(\"name\") < 50")
+        self.validation_rules_edit.setMaximumHeight(80) 
+        val_layout.addWidget(self.validation_rules_edit)
+        self.validation_group.setLayout(val_layout)
+        main_input_layout.addWidget(self.validation_group)
+
         self.input_group_box.setLayout(main_input_layout)
         self.main_layout.addWidget(self.input_group_box)
 
     def _create_results_ui(self):
         self.results_group_box = QGroupBox(self.tr("Analysis Results"))
-        results_layout = QVBoxLayout()
+        self.results_main_layout = QVBoxLayout()
+        
+        self.tabs = QtWidgets.QTabWidget()
+        
+        # --- Tab 1: Table ---
+        self.tab_table = QWidget()
+        table_layout = QVBoxLayout(self.tab_table)
         self.resultsTableWidget = QTableWidget()
         self.resultsTableWidget.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.resultsTableWidget.setAlternatingRowColors(True)
         self.resultsTableWidget.setSortingEnabled(True) 
-        results_layout.addWidget(self.resultsTableWidget)
+        table_layout.addWidget(self.resultsTableWidget)
+        
         button_layout = QHBoxLayout()
         self.copyButton = QPushButton(self.tr("Copy Table"))
-        self.exportButton = QPushButton(self.tr("Export Table"))
+        self.exportButton = QPushButton(self.tr("Export CSV"))
+        self.exportHtmlButton = QPushButton(self.tr("Export HTML"))
         button_layout.addStretch()
-        button_layout.addWidget(self.copyButton); button_layout.addWidget(self.exportButton)
-        results_layout.addLayout(button_layout)
-        self.results_group_box.setLayout(results_layout)
+        button_layout.addWidget(self.copyButton)
+        button_layout.addWidget(self.exportButton)
+        button_layout.addWidget(self.exportHtmlButton)
+        table_layout.addLayout(button_layout)
+        
+        self.tabs.addTab(self.tab_table, self.tr("Table"))
+        
+        # --- Tab 2: Charts ---
+        self.tab_charts = QWidget()
+        self.charts_layout = QVBoxLayout(self.tab_charts)
+        
+        if MATPLOTLIB_AVAILABLE:
+            self.figure = Figure()
+            self.canvas = FigureCanvas(self.figure)
+            self.charts_layout.addWidget(self.canvas)
+            self.chart_info_label = QLabel(self.tr("Select a field column in the table to view charts."))
+            self.chart_info_label.setAlignment(Qt.AlignCenter)
+            self.charts_layout.addWidget(self.chart_info_label)
+        else:
+            self.charts_layout.addWidget(QLabel(self.tr("Matplotlib not installed. Charts unavailable.")))
+            self.canvas = None
+
+        self.tabs.addTab(self.tab_charts, self.tr("Charts"))
+        
+        # --- Tab 3: Correlation ---
+        self.tab_correlation = QWidget()
+        corr_layout = QVBoxLayout(self.tab_correlation)
+        self.correlationTableWidget = QTableWidget()
+        self.correlationTableWidget.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.correlationTableWidget.setAlternatingRowColors(False) # Manual coloring
+        corr_layout.addWidget(self.correlationTableWidget)
+        self.tabs.addTab(self.tab_correlation, self.tr("Correlation"))
+        
+        # --- Tab 4: Validation Results ---
+        self.tab_validation = QWidget()
+        val_res_layout = QVBoxLayout(self.tab_validation)
+        self.validationResultsTable = QTableWidget()
+        self.validationResultsTable.setColumnCount(3)
+        self.validationResultsTable.setHorizontalHeaderLabels([self.tr("Rule"), self.tr("Fail Count"), self.tr("% Fail")])
+        self.validationResultsTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        val_res_layout.addWidget(self.validationResultsTable)
+        self.tabs.addTab(self.tab_validation, self.tr("Validation"))
+        
+        self.results_main_layout.addWidget(self.tabs)
+        self.results_group_box.setLayout(self.results_main_layout)
         self.results_group_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.main_layout.addWidget(self.results_group_box)
+
+        # Connect Selection for Charts
+        self.resultsTableWidget.itemSelectionChanged.connect(self.update_charts)
+
+
 
     def populate_fields(self, layer):
         self.fieldListWidget.clear()
@@ -304,6 +401,12 @@ class FieldProfilerDockWidget(QDockWidget):
         }
 
     def run_analysis(self):
+        # Check if task is already running
+        if self.current_task and self.current_task.status() == QgsTask.Running:
+            self.current_task.cancel()
+            self.analyzeButton.setText(self.tr("Analyze Selected Fields"))
+            return
+
         self.resultsTableWidget.clear(); self.resultsTableWidget.setRowCount(0); self.resultsTableWidget.setColumnCount(0)
         self.analysis_results_cache = OrderedDict()
         self.conversion_error_feature_ids_by_field = {}
@@ -316,159 +419,100 @@ class FieldProfilerDockWidget(QDockWidget):
         self.current_decimal_places = self.decimalPlacesSpinBox.value()
         self._was_analyzing_selected_features = self.selectedOnlyCheckbox.isChecked()
         detailed_options = self._get_detailed_options_state()
+        # Pass general config options too
+        detailed_options['limit_unique'] = self.current_limit_unique_display
+        detailed_options['decimal_places'] = self.current_decimal_places
+        detailed_options['scipy_available'] = SCIPY_AVAILABLE
 
         if not current_layer or not isinstance(current_layer, QgsVectorLayer):
             self.iface.messageBar().pushMessage(self.tr("Error"), self.tr("Please select a valid vector layer."), level=Qgis.Warning); return
         if not selected_list_items:
             self.iface.messageBar().pushMessage(self.tr("Error"), self.tr("Please select one or more fields to analyze."), level=Qgis.Warning); return
 
-        selected_field_names_from_widget = [item.text().split(" (")[0] for item in selected_list_items]
-        if not selected_field_names_from_widget:
-            self.iface.messageBar().pushMessage(self.tr("Error"), self.tr("Error extracting field names."), level=Qgis.Critical); return
+        selected_field_names = [item.text().split(" (")[0] for item in selected_list_items]
+        if not selected_field_names: return
 
-        request = QgsFeatureRequest()
-        feature_count_total_layer = current_layer.featureCount()
-        feature_count_analyzed = 0
-
+        # Determine features to analyze
+        selected_ids = []
         if self._was_analyzing_selected_features:
             selected_ids = current_layer.selectedFeatureIds()
             if not selected_ids:
-                self.iface.messageBar().pushMessage(self.tr("Warning"), self.tr("No features selected for analysis."), level=Qgis.Warning)
-                self.progressBar.setVisible(False); return
-            request.setFilterFids(selected_ids); feature_count_analyzed = len(selected_ids)
-            analysis_scope_message = self.tr("Analyzing Selected Features ({})").format(feature_count_analyzed)
+                self.iface.messageBar().pushMessage(self.tr("Warning"), self.tr("No features selected for analysis."), level=Qgis.Warning); return
+        
+        # Prepare Validation Rules
+        validation_rules = []
+        if self.validation_group.isChecked():
+            raw_rules = self.validation_rules_edit.toPlainText().split('\n')
+            validation_rules = [r.strip() for r in raw_rules if r.strip()]
+
+        # Setup Task
+        self.current_task = FieldProfilerTask(
+            current_layer, 
+            selected_field_names, 
+            detailed_options, 
+            selected_ids=selected_ids if selected_ids else None,
+            validation_rules=validation_rules
+        )
+        self.current_task.analysisFinished.connect(self.on_analysis_finished)
+        self.current_task.progressChanged.connect(self.progressBar.setValue)
+        
+        # UI Updates
+        self.analyzeButton.setText(self.tr("Cancel Analysis"))
+        self.progressBar.setVisible(True)
+        self.progressBar.setRange(0, 100)
+        self.progressBar.setValue(0)
+        
+        QgsApplication.taskManager().addTask(self.current_task)
+
+    def on_analysis_finished(self, results):
+        self.analyzeButton.setText(self.tr("Analyze Selected Fields"))
+        self.progressBar.setVisible(False)
+        
+        if not results:
+            self.iface.messageBar().pushMessage(self.tr("Info"), self.tr("Analysis cancelled or failed."), level=Qgis.Warning)
+            self.current_task = None
+            return
+
+        self.analysis_results_cache = results
+        
+        # Update helper dictionaries for selection from the task's results
+        self.conversion_error_feature_ids_by_field = {}
+        self.non_printable_char_feature_ids_by_field = {}
+
+        for fname, field_data in results.items():
+            if '_conversion_error_fids' in field_data:
+                self.conversion_error_feature_ids_by_field[fname] = field_data['_conversion_error_fids']
+                # Remove from display results, it's internal for selection
+                del field_data['_conversion_error_fids']
+            if '_non_printable_fids' in field_data:
+                self.non_printable_char_feature_ids_by_field[fname] = field_data['_non_printable_fids']
+                # Remove from display results, it's internal for selection
+                del field_data['_non_printable_fids']
+        
+        # Populate Correlation
+        if '_global_correlation' in results:
+            self.latest_correlation_matrix = results['_global_correlation']
+            self._populate_correlation_matrix(results['_global_correlation'])
+            del results['_global_correlation']
         else:
-            feature_count_analyzed = feature_count_total_layer
-            analysis_scope_message = self.tr("Analyzing All Features ({})").format(feature_count_analyzed)
-
-        if feature_count_analyzed == 0:
-            self.iface.messageBar().pushMessage(self.tr("Info"), self.tr("No features to analyze."), level=Qgis.Info, duration=5)
-            self.progressBar.setVisible(False); return
-
-        self.iface.messageBar().pushMessage(self.tr("Info"), analysis_scope_message, level=Qgis.Info, duration=3)
-        QApplication.processEvents()
-
-        self.progressBar.setRange(0, feature_count_analyzed if feature_count_analyzed > 0 else 100)
-        self.progressBar.setValue(0); self.progressBar.setVisible(True)
-
-        field_data_collector = OrderedDict()
-        qgs_fields_objects = current_layer.fields()
-        field_metadata = {}
-
-        valid_selected_field_names = []
-        for field_name in selected_field_names_from_widget:
-            field_index = qgs_fields_objects.lookupField(field_name)
-            if field_index == -1:
-                self.analysis_results_cache[field_name] = {'Error': 'Field not found'}; continue
+            self.latest_correlation_matrix = None
+            self.correlationTableWidget.clear()
+            self.correlationTableWidget.setRowCount(0)
+            self.correlationTableWidget.setColumnCount(0)
             
-            valid_selected_field_names.append(field_name)
-            field_obj = qgs_fields_objects.field(field_index)
-            field_metadata[field_name] = {'index': field_index, 'object': field_obj, 'type': field_obj.type()}
-            collector_init = {
-                'raw_values': [], 'null_count': 0,
-                'non_printable_fids': [] 
-            }
-            if field_obj.isNumeric():
-                collector_init.update({'float_values': [], 'conversion_errors': 0, 'conversion_error_feature_ids': []})
-            if field_obj.type() in [QVariant.Date, QVariant.DateTime]:
-                 collector_init['original_variants'] = []
+        # Handle Validation Results
+        if '_validation_results' in results:
+            self._populate_validation_results(results['_validation_results'])
+            del results['_validation_results']
+        else:
+            self.validationResultsTable.clear()
+            self.validationResultsTable.setRowCount(0)
 
-            field_data_collector[field_name] = collector_init
-        
-        if not valid_selected_field_names:
-            self.populate_results_table(self.analysis_results_cache, selected_field_names_from_widget)
-            self.progressBar.setVisible(False); return
-
-        current_iterator = current_layer.getFeatures(request)
-        iteration_count = 0
-        try:
-            for feature in current_iterator:
-                iteration_count += 1
-                fid = feature.id()
-                for field_name in valid_selected_field_names:
-                    meta = field_metadata[field_name]
-                    collector = field_data_collector[field_name]
-                    val = feature[meta['index']]
-                    
-                    if meta['type'] in [QVariant.Date, QVariant.DateTime]:
-                        collector['original_variants'].append(val if (val is not None and not (hasattr(val, 'isNull') and val.isNull())) else None)
-
-                    if val is None or (hasattr(val, 'isNull') and val.isNull()):
-                        collector['null_count'] += 1
-                    else:
-                        collector['raw_values'].append(val)
-                        if meta['object'].isNumeric():
-                            try:
-                                collector['float_values'].append(float(val))
-                            except (ValueError, TypeError):
-                                collector['conversion_errors'] += 1
-                                collector['conversion_error_feature_ids'].append(fid)
-                        elif meta['type'] == QVariant.String:
-                            if detailed_options['text_rarity_nonprintable']:
-                                if self._has_non_printable_chars(str(val)):
-                                    collector['non_printable_fids'].append(fid)
-
-                if iteration_count % 100 == 0 or iteration_count == feature_count_analyzed:
-                    self.progressBar.setValue(iteration_count); QApplication.processEvents()
-        except Exception as e_iter:
-            for field_name in valid_selected_field_names: self.analysis_results_cache[field_name] = {'Error': f'Feature iteration error: {e_iter}'}
-            self.populate_results_table(self.analysis_results_cache, selected_field_names_from_widget)
-            self.progressBar.setVisible(False); return
-        
-        self.progressBar.setValue(feature_count_analyzed)
-
-        for field_name in valid_selected_field_names:
-            data = field_data_collector[field_name]
-            meta = field_metadata[field_name]
-
-            if meta['object'].isNumeric() and data.get('conversion_error_feature_ids'):
-                self.conversion_error_feature_ids_by_field[field_name] = data['conversion_error_feature_ids']
-            if meta['type'] == QVariant.String and data.get('non_printable_fids'):
-                self.non_printable_char_feature_ids_by_field[field_name] = list(set(data['non_printable_fids'])) 
-
-            non_null_count = len(data['raw_values'])
-            percent_null = (data['null_count'] / feature_count_analyzed * 100) if feature_count_analyzed > 0 else 0
-            field_results = OrderedDict([('Null Count', data['null_count']), ('% Null', f"{percent_null:.2f}%"), ('Non-Null Count', non_null_count)])
-            
-            status_set = False
-            if non_null_count == 0:
-                if meta['object'].isNumeric() and data.get('conversion_errors', 0) > 0:
-                    field_results['Status'] = f"All values Null or conversion errors ({data['conversion_errors']})"
-                else:
-                    field_results['Status'] = 'All Null or Empty'
-                status_set = True
-            
-            analysis_for_field = {}
-            if not status_set: 
-                try:
-                    if meta['object'].isNumeric():
-                        analysis_for_field = self.analyze_numeric_field_from_list(data['float_values'], data.get('conversion_errors',0), detailed_options, non_null_count)
-                    elif meta['type'] == QVariant.String:
-                        analysis_for_field = self.analyze_text_field(data['raw_values'], non_null_count, detailed_options)
-                    elif meta['type'] in [QVariant.Date, QVariant.DateTime]:
-                        original_variants = data.get('original_variants', data['raw_values'])
-                        analysis_for_field = self.analyze_date_field_enhanced(original_variants, non_null_count, detailed_options)
-                    else:
-                        analysis_for_field = {'Status': 'Analysis not implemented for this type'}
-                except Exception as e_analysis:
-                    analysis_for_field = {'Error': f'Analysis function error: {e_analysis}'}
-            
-            field_results.update(analysis_for_field)
-
-            hint = "N/A"
-            if meta['type'] == QVariant.String and non_null_count > 0:
-                numeric_like_count = sum(1 for s_val in data['raw_values'] if str(s_val).replace('.', '', 1).strip().isdigit()) # strip to handle " 123 "
-                if numeric_like_count / non_null_count > 0.9: 
-                    hint = "High % of numeric-like strings. Consider if this field should be numeric."
-            elif meta['object'].isNumeric() and non_null_count > 0:
-                if field_results.get('Variety (distinct)', float('inf')) < 15 and non_null_count > 20:
-                     hint = "Low variety for a numeric field. Consider if this is categorical or a code."
-
-            field_results['Data Type Mismatch Hint'] = hint
-            self.analysis_results_cache[field_name] = field_results
-        
-        self.populate_results_table(self.analysis_results_cache, selected_field_names_from_widget)
-        self.progressBar.setVisible(False); QApplication.processEvents()
+        # Populate table
+        field_names = list(results.keys())
+        self.populate_results_table(self.analysis_results_cache, field_names)
+        self.iface.messageBar().pushMessage(self.tr("Success"), self.tr("Analysis complete."), level=Qgis.Success)
+        self.current_task = None  # Clear task reference after completion
 
     def populate_results_table(self, results_data, field_names_for_header):
         self.resultsTableWidget.clear()
@@ -593,486 +637,79 @@ class FieldProfilerDockWidget(QDockWidget):
         
         self.resultsTableWidget.resizeColumnsToContents()
 
-    def analyze_numeric_field_from_list(self, non_null_values_list_float, conversion_errors, options, total_non_null_count):
-        results = OrderedDict()
-        results['Conversion Errors'] = conversion_errors
-        
-        try:
-            data_np = numpy.array(non_null_values_list_float, dtype=float)
-            if numpy.any(numpy.isinf(data_np)): 
-                data_np = data_np[~numpy.isinf(data_np)]
-        except Exception: 
-            data_np = numpy.array([], dtype=float) 
-
-        count_val = len(data_np)
-
-        if count_val == 0:
-            results['Status'] = 'No valid numeric data' if conversion_errors == 0 else f'No valid data ({conversion_errors} conversion errors)'
-            for key in self.STAT_KEYS_NUMERIC:
-                if key not in ['Non-Null Count', 'Null Count', '% Null', 'Conversion Errors', 'Status']:
-                    if key in ['Variety (distinct)', 'Zeros', 'Positives', 'Negatives', 'Outliers (IQR)', 'Integer Values', 'Decimal Values', '% Outliers', 'Min Outlier', 'Max Outlier']: results[key] = 0
-                    elif key in ['Low Variance Flag', 'Normality (Likely Normal)']: results[key] = False
-                    elif key == '% Integer Values': results[key] = f"{0.0:.2f}%"
-                    else: results[key] = 'N/A'
-            return results
-
-        min_val = numpy.nanmin(data_np) if count_val > 0 else numpy.nan
-        max_val = numpy.nanmax(data_np) if count_val > 0 else numpy.nan
-        sum_val = numpy.nansum(data_np) if count_val > 0 else numpy.nan
-        mean_val = numpy.nanmean(data_np) if count_val > 0 else numpy.nan
-        median_val = numpy.nanmedian(data_np) if count_val > 0 else numpy.nan
-        
-        results['Min'] = min_val; results['Max'] = max_val
-        results['Range'] = max_val - min_val if not (numpy.isnan(min_val) or numpy.isnan(max_val)) else numpy.nan
-        results['Sum'] = sum_val; results['Mean'] = mean_val; results['Median'] = median_val
-
-        std_dev_pop = numpy.std(data_np) if count_val > 0 else numpy.nan
-        results['Stdev (pop)'] = std_dev_pop
-
-        modes_val = 'N/A'
-        if count_val > 0:
-            if SCIPY_AVAILABLE:
-                try: 
-                    mode_res = scipy_stats.mode(data_np, nan_policy='omit', keepdims=False) 
-                    if hasattr(mode_res, 'mode') and numpy.size(mode_res.mode) > 0:
-                        modes_val = list(mode_res.mode) if isinstance(mode_res.mode, numpy.ndarray) else [mode_res.mode]
-                    elif not hasattr(mode_res, 'mode') and isinstance(mode_res, tuple) and len(mode_res) > 0: # Older scipy
-                        if numpy.size(mode_res[0]) > 0:
-                             modes_val = list(mode_res[0])
-                        else: modes_val = 'N/A (no mode or all unique)'
-                    else: 
-                        modes_val = 'N/A (no mode or all unique)'
-                except Exception:
-                     modes_val = 'N/A (mode error)'
-            else: 
-                try:
-                    # Ensure data_np is not empty before tolist()
-                    modes_val = statistics.multimode(data_np.tolist()) if data_np.size > 0 else 'N/A (no data)'
-                except statistics.StatisticsError: # No unique mode or data is empty
-                    modes_val = 'N/A (no unique mode / empty)'
-                except TypeError: # if data_np contains NaNs, multimode might fail
-                    try:
-                        non_nan_list = [x for x in data_np.tolist() if not numpy.isnan(x)]
-                        if non_nan_list:
-                            modes_val = statistics.multimode(non_nan_list)
-                        else:
-                            modes_val = 'N/A (all NaN or empty)'
-                    except statistics.StatisticsError:
-                         modes_val = 'N/A (no unique mode after NaN removal)'
-
-        results['Mode(s)'] = modes_val
-
-        results['Variety (distinct)'] = len(numpy.unique(data_np[~numpy.isnan(data_np)])) if count_val > 0 else 0
-        
-        q1, q3, iqr_val = numpy.nan, numpy.nan, numpy.nan
-        outlier_count = 0
-        min_outlier_val, max_outlier_val, percent_outliers = numpy.nan, numpy.nan, 0.0 # Default percent_outliers to 0.0
-
-        if count_val > 0:
-            q1 = numpy.nanpercentile(data_np, 25)
-            q3 = numpy.nanpercentile(data_np, 75)
-            if not (numpy.isnan(q1) or numpy.isnan(q3)):
-                iqr_val = q3 - q1
-                if options.get('numeric_outlier_details', True) and not numpy.isnan(iqr_val) : # Ensure iqr_val is not NaN
-                    lower_bound = q1 - 1.5 * iqr_val
-                    upper_bound = q3 + 1.5 * iqr_val
-                    outliers_bool = (data_np < lower_bound) | (data_np > upper_bound)
-                    outliers_vals = data_np[outliers_bool & ~numpy.isnan(data_np)] 
-                    outlier_count = len(outliers_vals)
-                    if outlier_count > 0:
-                        min_outlier_val = numpy.min(outliers_vals)
-                        max_outlier_val = numpy.max(outliers_vals)
-                    # Calculate percent_outliers based on count_val (total non-NaN valid numerics)
-                    percent_outliers = (outlier_count / count_val * 100.0) if count_val > 0 else 0.0
-
-        results['Q1'] = q1; results['Q3'] = q3; results['IQR'] = iqr_val
-        results['Outliers (IQR)'] = outlier_count
-        if options.get('numeric_outlier_details', True):
-            results['Min Outlier'] = min_outlier_val
-            results['Max Outlier'] = max_outlier_val
-            results['% Outliers'] = percent_outliers # Already a float
-        else:
-            results['Min Outlier'] = "N/A (Opt.)"; results['Max Outlier'] = "N/A (Opt.)"; results['% Outliers'] = "N/A (Opt.)"
-
-
-        low_variance = False
-        if count_val == 1: low_variance = True
-        elif not numpy.isnan(std_dev_pop) and numpy.isclose(std_dev_pop, 0.0): low_variance = True
-        elif results['Variety (distinct)'] == 1 and count_val > 1: low_variance = True
-        results['Low Variance Flag'] = low_variance
-        
-        results['Zeros'] = numpy.sum(data_np == 0) if count_val > 0 else 0
-        results['Positives'] = numpy.sum(data_np > 0) if count_val > 0 else 0
-        results['Negatives'] = numpy.sum(data_np < 0) if count_val > 0 else 0
-        
-        cv = numpy.nan
-        if not numpy.isnan(mean_val) and mean_val != 0 and not numpy.isnan(std_dev_pop):
-            cv = (std_dev_pop / mean_val) * 100
-        results['CV %'] = cv
-
-        if options.get('numeric_int_decimal', False) and count_val > 0:
-            valid_data_for_int_check = data_np[~numpy.isnan(data_np)] 
-            integer_values_count = numpy.sum(valid_data_for_int_check == numpy.floor(valid_data_for_int_check))
-            results['Integer Values'] = int(integer_values_count)
-            results['Decimal Values'] = len(valid_data_for_int_check) - int(integer_values_count) 
-            results['% Integer Values'] = (int(integer_values_count) / len(valid_data_for_int_check) * 100.0) if len(valid_data_for_int_check) > 0 else 0.0
+    def _populate_correlation_matrix(self, corr_data):
+        self.correlationTableWidget.clear()
+        if 'Error' in corr_data:
+            # Show error in table?
+            return
             
-            # Optimal Bins
-            optimal_bins_val = "N/A"
-            if count_val > 1 and not numpy.isnan(iqr_val) and iqr_val > 0 and not (numpy.isnan(min_val) or numpy.isnan(max_val)):
-                bin_width = 2 * iqr_val / (count_val**(1/3))
-                if bin_width > 0 : 
-                    data_range = max_val - min_val
-                    if not numpy.isnan(data_range) and data_range > 0:
-                         optimal_bins_val = int(numpy.ceil(data_range / bin_width))
-                    elif data_range == 0: 
-                         optimal_bins_val = 1
-                    # else data_range is NaN or negative (shouldn't happen if min/max are valid)
-                # else bin_width is zero or negative (e.g. if count_val is huge or iqr_val very small)
-            elif count_val > 0 and results['Variety (distinct)'] > 0: # Fallback if IQR method not suitable
-                optimal_bins_val = results['Variety (distinct)']
-            elif count_val == 1:
-                optimal_bins_val = 1
-
-            results['Optimal Bins (Freedman-Diaconis)'] = optimal_bins_val
-        else:
-            results['Integer Values'] = "N/A (Opt.)"; results['Decimal Values'] = "N/A (Opt.)"; results['% Integer Values'] = "N/A (Opt.)"
-            results['Optimal Bins (Freedman-Diaconis)'] = "N/A (Opt.)"
-
-
-        if options.get('numeric_dist_shape', False) and SCIPY_AVAILABLE and count_val > 0:
-            data_for_scipy = data_np[~numpy.isnan(data_np)] 
-            if len(data_for_scipy) > 0:
-                results['Skewness'] = scipy_stats.skew(data_for_scipy) if len(data_for_scipy) > 0 else numpy.nan
-                results['Kurtosis'] = scipy_stats.kurtosis(data_for_scipy, fisher=True) if len(data_for_scipy) > 0 else numpy.nan
-                if len(data_for_scipy) >= 3: 
-                    try:
-                        shapiro_stat, shapiro_p = scipy_stats.shapiro(data_for_scipy)
-                        results['Normality (Shapiro-Wilk p)'] = shapiro_p
-                        results['Normality (Likely Normal)'] = bool(shapiro_p > 0.05) 
-                    except ValueError as e_shapiro: # Handles cases like "Data must be at least 3 samples" or "Data must be distinct"
-                        results['Normality (Shapiro-Wilk p)'] = "N/A (Error)" # More generic, could log e_shapiro
-                        results['Normality (Likely Normal)'] = "N/A (Error)"
-                else:
-                    results['Normality (Shapiro-Wilk p)'] = "N/A (<3 valid)"
-                    results['Normality (Likely Normal)'] = "N/A (<3 valid)"
-            else: 
-                results['Skewness'] = numpy.nan; results['Kurtosis'] = numpy.nan
-                results['Normality (Shapiro-Wilk p)'] = "N/A (all NaN)"; results['Normality (Likely Normal)'] = "N/A (all NaN)"
-
-        elif options.get('numeric_dist_shape', False) and not SCIPY_AVAILABLE:
-            scipy_na_msg = "N/A (Scipy missing)"
-            results['Skewness'] = scipy_na_msg; results['Kurtosis'] = scipy_na_msg
-            results['Normality (Shapiro-Wilk p)'] = scipy_na_msg; results['Normality (Likely Normal)'] = scipy_na_msg
-        else: 
-            opt_na_msg = "N/A (Opt.)"
-            results['Skewness'] = opt_na_msg; results['Kurtosis'] = opt_na_msg
-            results['Normality (Shapiro-Wilk p)'] = opt_na_msg; results['Normality (Likely Normal)'] = opt_na_msg
-
-
-        if options.get('numeric_adv_percentiles', False) and count_val > 0:
-            percentiles_to_calc = [1, 5, 95, 99]
-            # Ensure data_np is not all NaNs before calling nanpercentile
-            if not numpy.all(numpy.isnan(data_np)):
-                pctl_values = numpy.nanpercentile(data_np, percentiles_to_calc)
-                results['1st Pctl'] = pctl_values[0]
-                results['5th Pctl'] = pctl_values[1]
-                results['95th Pctl'] = pctl_values[2]
-                results['99th Pctl'] = pctl_values[3]
-            else:
-                nan_val = numpy.nan
-                results['1st Pctl'] = nan_val; results['5th Pctl'] = nan_val
-                results['95th Pctl'] = nan_val; results['99th Pctl'] = nan_val
-        else:
-            opt_na_msg = "N/A (Opt.)"
-            results['1st Pctl'] = opt_na_msg; results['5th Pctl'] = opt_na_msg
-            results['95th Pctl'] = opt_na_msg; results['99th Pctl'] = opt_na_msg
-            
-        return results
-
-    def _has_non_printable_chars(self, text_value):
-        if not isinstance(text_value, str): return False
-        allowed_control = {'\t', '\n', '\r'} 
-        return any(not c.isprintable() and c not in allowed_control for c in text_value)
-
-
-    def analyze_text_field(self, values, non_null_count, options):
-        results = OrderedDict(); dp = self.current_decimal_places
+        fields = corr_data.get('fields', [])
+        matrix = corr_data.get('matrix', [])
         
-        if non_null_count == 0: 
-            results['Status'] = 'No text data'
-            for key in self.STAT_KEYS_TEXT:
-                 if key not in ['Non-Null Count', 'Null Count', '% Null', 'Status']:
-                    if key in ['Empty Strings', 'Leading/Trailing Spaces', 'Internal Multiple Spaces', 
-                               'Variety (distinct)', 'Values Occurring Once', 'Non-Printable Chars Count']: results[key] = 0
-                    elif key == '% Empty': results[key] = f"{0.0:.{dp}f}%"
-                    elif key.startswith('%') and ('Case' in key): results[key] = f"{0.0:.{dp}f}%" 
-                    else: results[key] = 'N/A'
-            return results
-
-        str_values = [str(v) if v is not None else "" for v in values] # Ensure all are strings, handle None as empty
-
-        empty_string_count = str_values.count('')
-        percent_empty = (empty_string_count / non_null_count * 100.0) if non_null_count > 0 else 0.0
-        results['Empty Strings'] = empty_string_count
-        results['% Empty'] = f"{percent_empty:.{dp}f}%" 
+        if not fields or not matrix: return
         
-        non_empty_str_values = [s for s in str_values if s] 
-        count_non_empty = len(non_empty_str_values)
-
-        min_len, max_len, avg_len_val = 'N/A', 'N/A', 'N/A'
-        if count_non_empty > 0:
-            lengths = [len(s) for s in non_empty_str_values]
-            min_len, max_len, avg_len_val = min(lengths), max(lengths), statistics.mean(lengths)
-        results['Min Length'] = min_len; results['Max Length'] = max_len
-        results['Avg Length'] = f"{avg_len_val:.{dp}f}" if isinstance(avg_len_val, float) else avg_len_val
+        n = len(fields)
+        self.correlationTableWidget.setRowCount(n)
+        self.correlationTableWidget.setColumnCount(n)
+        self.correlationTableWidget.setHorizontalHeaderLabels(fields)
+        self.correlationTableWidget.setVerticalHeaderLabels(fields)
         
-        value_counts = Counter(str_values) 
-        results['Variety (distinct)'] = len(value_counts)
-        
-        sorted_counts = sorted(value_counts.items(), key=lambda item: (-item[1], item[0]))
-        top_unique_list = []; actual_first_unique_value_for_selection = None
-        limit_unique = self.current_limit_unique_display
-        if sorted_counts:
-            actual_first_unique_value_for_selection = sorted_counts[0][0]
-            for i, (val_str, count) in enumerate(sorted_counts):
-                if i >= limit_unique: break
-                display_val_preview = f"'{val_str[:50]}{'...' if len(val_str) > 50 else ''}'"
-                if val_str == "": display_val_preview = self.tr("'(Empty String)'")
-                top_unique_list.append(f"{display_val_preview}: {count}")
-        results['Unique Values (Top)'] = "\n".join(top_unique_list) if top_unique_list else "N/A"
-        if top_unique_list: # Store even if None or empty string
-            results['Unique Values (Top)_actual_first_value'] = actual_first_unique_value_for_selection
-        
-        if options.get('text_rarity_nonprintable', False):
-            # Values occurring once should exclude empty strings from this specific count if desired
-            # (currently includes empty string if it appears once)
-            results['Values Occurring Once'] = sum(1 for v_str,c in value_counts.items() if c == 1) 
-            results['Non-Printable Chars Count'] = sum(1 for s_val in str_values if self._has_non_printable_chars(s_val))
-        else:
-            results['Values Occurring Once'] = "N/A (Opt.)"
-            results['Non-Printable Chars Count'] = "N/A (Opt.)"
-
-        if options.get('text_case_analysis', False):
-            if count_non_empty > 0:
-                upper_count = sum(1 for s_val in non_empty_str_values if s_val.isupper())
-                lower_count = sum(1 for s_val in non_empty_str_values if s_val.islower())
-                title_count = sum(1 for s_val in non_empty_str_values if s_val.istitle())
+        for r in range(n):
+            for c in range(n):
+                val = matrix[r][c]
+                item = QTableWidgetItem(f"{val:.2f}")
+                item.setTextAlignment(Qt.AlignCenter)
                 
-                # Calculate mixed_count more accurately: non-empty strings that are not
-                # purely uppercase, not purely lowercase, and not purely titlecase.
-                mixed_count = 0
-                for s_val in non_empty_str_values:
-                    is_u = s_val.isupper()
-                    is_l = s_val.islower()
-                    is_t = s_val.istitle()
-                    # A string is "mixed" if it's not any single one of these exclusively.
-                    # However, a string like "I" is_upper and is_title.
-                    # Simplest for "Mixed Case" is: total_non_empty - (exclusive_upper + exclusive_lower + exclusive_title)
-                    # This requires identifying exclusive cases or defining mixed as "none of the above".
-                    # Current definition of % Mixed Case as 100 - sum_of_others is an approximation of "not one of the main categories".
-                    # Let's count strings that are *not* (isupper OR islower OR istitle)
-                    # This is still complex. Let's stick to the sum-based approach for now.
-                    # The sum of these % might exceed 100% if a string fits multiple (e.g. "I" is upper & title)
-                    # A clearer approach:
-                    # % Uppercase: s.isupper() and not s.islower() and not s.istitle() (unless it's trivial like "I")
-                    # This is too complex for summary stats. The current independent counts are fine.
-
-                results['% Uppercase'] = f"{(upper_count / count_non_empty * 100.0):.{dp}f}%"
-                results['% Lowercase'] = f"{(lower_count / count_non_empty * 100.0):.{dp}f}%"
-                results['% Titlecase'] = f"{(title_count / count_non_empty * 100.0):.{dp}f}%"
+                # Colorize
+                # -1 (Red) ... 0 (White) ... 1 (Blue)
+                # Or simply:
+                # Abs value > 0.7 = Strong (Darker), < 0.3 = Weak (Lighter)
+                bg_color = QtGui.QColor(255, 255, 255)
+                if val > 0:
+                    # Blue-ish
+                    intensity = int(255 * (1 - abs(val)))
+                    bg_color = QtGui.QColor(intensity, intensity, 255)
+                elif val < 0:
+                     # Red-ish
+                    intensity = int(255 * (1 - abs(val)))
+                    bg_color = QtGui.QColor(255, intensity, intensity)
                 
-                # For % Mixed Case: count strings that are not fully upper, not fully lower, not fully title
-                # This is tricky due to overlaps (e.g. "A" is upper and title).
-                # A simple definition of mixed: if it has both upper and lower characters, and is not title.
-                # Or, more simply, items that don't fall into a clear category.
-                # The previous (100 - sum) is problematic if sum > 100.
-                # Count explicitly:
-                explicit_mixed_count = 0
-                for s in non_empty_str_values:
-                    if not s.isupper() and not s.islower() and not s.istitle():
-                        explicit_mixed_count +=1
-                results['% Mixed Case'] = f"{(explicit_mixed_count / count_non_empty * 100.0):.{dp}f}%"
-
-
-                results['Internal Multiple Spaces'] = sum(1 for s_val in non_empty_str_values if "  " in s_val.strip()) 
-            else: 
-                na_percent = f"{0.0:.{dp}f}%"
-                results['% Uppercase'] = na_percent; results['% Lowercase'] = na_percent
-                results['% Titlecase'] = na_percent; results['% Mixed Case'] = na_percent
-                results['Internal Multiple Spaces'] = 0
-        else: 
-            opt_na_msg = "N/A (Opt.)"
-            results['% Uppercase'] = opt_na_msg; results['% Lowercase'] = opt_na_msg
-            results['% Titlecase'] = opt_na_msg; results['% Mixed Case'] = opt_na_msg
-            results['Internal Multiple Spaces'] = opt_na_msg
-
-
-        results['Leading/Trailing Spaces'] = sum(1 for s_val in non_empty_str_values if s_val != s_val.strip())
-        
-        word_list = []
-        for text in non_empty_str_values:
-            cleaned_text = text.lower(); cleaned_text = re.sub(r'[^\w\s-]', '', cleaned_text) # Keep hyphens in words
-            words = cleaned_text.split()
-            word_list.extend([word for word in words if word and word not in STOP_WORDS and not word.isdigit()])
-        if word_list:
-            word_counts = Counter(word_list)
-            top_words_list = [f"{word}:{count}" for word, count in word_counts.most_common(10)]
-            results['Top Words'] = "\n".join(top_words_list) if top_words_list else "N/A"
-        else: results['Top Words'] = "N/A (No words found)"
-        
-        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        # More robust URL pattern allowing various TLDs and paths
-        url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[-\w._/?#%&@!=कोंडीत]*)*' 
-        emails_found = sum(1 for text in non_empty_str_values if re.search(email_pattern, text))
-        urls_found = sum(1 for text in non_empty_str_values if re.search(url_pattern, text))
-        results['Pattern Matches'] = f"Emails: {emails_found}, URLs: {urls_found}"
-        
-        return results
-
-    def analyze_date_field_enhanced(self, original_variant_values, non_null_count, options):
-        results = OrderedDict()
-        dp = self.current_decimal_places 
-
-        if non_null_count == 0:
-            results['Status'] = 'No date data'
-            for key in self.STAT_KEYS_DATE:
-                 if key not in ['Non-Null Count', 'Null Count', '% Null', 'Status']:
-                    if key in ['Dates Before Today', 'Dates After Today']: results[key] = 0
-                    elif key.startswith('%') and ('Time' in key or 'Dates' in key): results[key] = f"{0.0:.{dp}f}%"
-                    else: results[key] = 'N/A'
-            return results
-
-        py_datetimes = []    
-        q_date_time_objects = [] # Store QDate or QDateTime objects for unique value counting
-        
-        # has_time_component_overall = False # Not strictly needed if we check instance type later
-
-        for v_orig in original_variant_values: 
-            if v_orig is None: continue 
-
-            py_dt = None
-            q_obj_for_unique = None # This will be QDate or QDateTime
-
-            if isinstance(v_orig, QDateTime) and v_orig.isValid():
-                py_dt = v_orig.toPyDateTime()
-                q_obj_for_unique = v_orig 
-                # has_time_component_overall = True
-            elif isinstance(v_orig, QDate) and v_orig.isValid():
-                # Convert QDate to Python datetime at midnight for consistent list type
-                py_dt = datetime(v_orig.year(), v_orig.month(), v_orig.day()) 
-                q_obj_for_unique = v_orig
-            elif isinstance(v_orig, str): # Attempt to parse string dates if necessary
-                # This part is tricky and depends on expected formats.
-                # For now, assume QGIS provides correct QVariant types.
-                # If string parsing is needed, it would go here with try-except blocks.
-                pass
-
-            if py_dt and q_obj_for_unique:
-                py_datetimes.append(py_dt)
-                q_date_time_objects.append(q_obj_for_unique)
-        
-        if not py_datetimes: 
-            results['Status'] = 'No valid date objects parsed'
-            for key in self.STAT_KEYS_DATE: 
-                 if key not in ['Non-Null Count', 'Null Count', '% Null', 'Status']:
-                    if key in ['Dates Before Today', 'Dates After Today']: results[key] = 0
-                    elif key.startswith('%') and ('Time' in key or 'Dates' in key): results[key] = f"{0.0:.{dp}f}%"
-                    else: results[key] = 'N/A'
-            return results
-
-        min_d, max_d = min(py_datetimes), max(py_datetimes)
-        # Format based on whether time is present in the original QDateTime objects
-        # This requires checking the original_variant_values or if any QDateTime was found
-        is_datetime_field = any(isinstance(q_obj, QDateTime) for q_obj in q_date_time_objects)
-
-        results['Min Date'] = min_d.isoformat(sep=' ', timespec='auto') if is_datetime_field else min_d.date().isoformat()
-        results['Max Date'] = max_d.isoformat(sep=' ', timespec='auto') if is_datetime_field else max_d.date().isoformat()
-
-        years = [d.year for d in py_datetimes]
-        months = [d.month for d in py_datetimes] 
-        days_of_week_num = [d.weekday() for d in py_datetimes] # Monday is 0 and Sunday is 6
-
-        day_names_map = [self.tr("Mon"), self.tr("Tue"), self.tr("Wed"), self.tr("Thu"), self.tr("Fri"), self.tr("Sat"), self.tr("Sun")]
-        month_names_map = ["", self.tr("Jan"), self.tr("Feb"), self.tr("Mar"), self.tr("Apr"), 
-                           self.tr("May"), self.tr("Jun"), self.tr("Jul"), self.tr("Aug"), 
-                           self.tr("Sep"), self.tr("Oct"), self.tr("Nov"), self.tr("Dec")]
-
-
-        results['Common Years'] = ", ".join([f"{yr}:{cnt}" for yr, cnt in Counter(years).most_common(3)])
-        results['Common Months'] = ", ".join([f"{month_names_map[mo]}:{cnt}" for mo, cnt in Counter(months).most_common(3)])
-        results['Common Days'] = ", ".join([f"{day_names_map[d]}:{cnt}" for d, cnt in Counter(days_of_week_num).most_common(3)])
-        
-        today_pydate = datetime.now().date() # Compare dates only for "Before/After Today"
-        results['Dates Before Today'] = sum(1 for d_py in py_datetimes if d_py.date() < today_pydate)
-        results['Dates After Today'] = sum(1 for d_py in py_datetimes if d_py.date() > today_pydate)
-
-        # Use the collected QDate/QDateTime objects for unique value counting
-        date_counts = Counter(q_date_time_objects) 
-        sorted_date_counts = sorted(date_counts.items(), key=lambda item: (-item[1], item[0])) 
-        top_unique_dates_list = []; actual_first_unique_date_for_selection = None
-        limit_unique = self.current_limit_unique_display
-        if sorted_date_counts:
-            actual_first_unique_date_for_selection = sorted_date_counts[0][0] # This is a QDate or QDateTime object
-            for i, (date_obj, count) in enumerate(sorted_date_counts):
-                if i >= limit_unique: break
+                item.setBackground(bg_color)
+                # Text contrast? If intensity < 100, text white
+                if abs(val) > 0.6: item.setForeground(QtGui.QColor(255, 255, 255) if val > 0 else QtGui.QColor(0,0,0)) # Tweaked
                 
-                if isinstance(date_obj, QDateTime):
-                    display_val_preview = date_obj.toString(Qt.ISODateWithMs if date_obj.time().msec() > 0 else Qt.ISODate)
-                elif isinstance(date_obj, QDate):
-                    display_val_preview = date_obj.toString(Qt.ISODate)
-                else: # Should not happen if collection is correct
-                    display_val_preview = str(date_obj)
-
-                top_unique_dates_list.append(f"'{display_val_preview}': {count}")
-        results['Unique Values (Top)'] = "\n".join(top_unique_dates_list) if top_unique_dates_list else "N/A"
-        if top_unique_dates_list: # Store the QDate/QDateTime object
-            results['Unique Values (Top)_actual_first_value'] = actual_first_unique_date_for_selection
+                self.correlationTableWidget.setItem(r, c, item)
+        
+        
+        self.correlationTableWidget.resizeColumnsToContents()
 
 
-        if options.get('date_time_weekend', False) and q_date_time_objects:
-            midnight_count = 0
-            noon_count = 0
-            hours_list = []
+    def _populate_validation_results(self, val_data):
+        self.validationResultsTable.clearContents()
+        self.validationResultsTable.setRowCount(0)
+        
+        if not val_data: return
+        
+        rules = val_data.get('rules', [])
+        counts = val_data.get('fail_counts', [])
+        total = val_data.get('total_checked', 0)
+        
+        self.validationResultsTable.setRowCount(len(rules))
+        for i, rule in enumerate(rules):
+            count = counts[i]
+            pct = (count / total * 100) if total > 0 else 0
             
-            q_datetimes_only = [q_obj for q_obj in q_date_time_objects if isinstance(q_obj, QDateTime)]
+            item_rule = QTableWidgetItem(rule)
+            item_count = QTableWidgetItem(str(count))
+            item_pct = QTableWidgetItem(f"{pct:.2f}%")
             
-            if q_datetimes_only: 
-                for q_dt_obj in q_datetimes_only:
-                    time_obj = q_dt_obj.time()
-                    hours_list.append(time_obj.hour())
-                    if time_obj == QTime(0,0,0,0): midnight_count +=1
-                    if time_obj == QTime(12,0,0,0): noon_count +=1
-                
-                results['Common Hours (Top 3)'] = ", ".join([f"{hr:02d}:00 ({cnt})" for hr, cnt in Counter(hours_list).most_common(3)]) if hours_list else "N/A"
-                results['% Midnight Time'] = f"{(midnight_count / len(q_datetimes_only) * 100.0):.{dp}f}%"
-                results['% Noon Time'] = f"{(noon_count / len(q_datetimes_only) * 100.0):.{dp}f}%"
-            else: 
-                results['Common Hours (Top 3)'] = "N/A (No time data)"
-                results['% Midnight Time'] = f"{0.0:.{dp}f}%" # Or N/A if preferred
-                results['% Noon Time'] = f"{0.0:.{dp}f}%"
+            if count > 0:
+                item_count.setForeground(QtGui.QColor(255, 0, 0)) # Red for failures
             
-            all_q_dates_for_dow = []
-            for q_obj in q_date_time_objects: # Use original QDate/QDateTime objects
-                if isinstance(q_obj, QDateTime):
-                    all_q_dates_for_dow.append(q_obj.date()) # Get QDate part
-                elif isinstance(q_obj, QDate):
-                    all_q_dates_for_dow.append(q_obj)
-            
-            if all_q_dates_for_dow:
-                # QDate.dayOfWeek(): Monday = 1, ..., Sunday = 7
-                weekend_day_count = sum(1 for d_obj in all_q_dates_for_dow if d_obj.dayOfWeek() >= 6) # Saturday or Sunday
-                total_for_dow_calc = len(all_q_dates_for_dow)
-                results['% Weekend Dates'] = f"{(weekend_day_count / total_for_dow_calc * 100.0):.{dp}f}%"
-                results['% Weekday Dates'] = f"{((total_for_dow_calc - weekend_day_count) / total_for_dow_calc * 100.0):.{dp}f}%"
-            else: 
-                 results['% Weekend Dates'] = f"{0.0:.{dp}f}%"; results['% Weekday Dates'] = f"{0.0:.{dp}f}%"
-        else: 
-            opt_na_msg = "N/A (Opt.)"
-            results['Common Hours (Top 3)'] = opt_na_msg; results['% Midnight Time'] = opt_na_msg; results['% Noon Time'] = opt_na_msg
-            results['% Weekend Dates'] = opt_na_msg; results['% Weekday Dates'] = opt_na_msg
-            
-        return results
+            self.validationResultsTable.setItem(i, 0, item_rule)
+            self.validationResultsTable.setItem(i, 1, item_count)
+            self.validationResultsTable.setItem(i, 2, item_pct)
+
 
     def _on_cell_double_clicked(self, row, column):
         if column == 0:
@@ -1102,7 +739,7 @@ class FieldProfilerDockWidget(QDockWidget):
             self.iface.messageBar().pushMessage(self.tr("Selection Error"), self.tr("Field '{0}' not found in layer.").format(field_name_for_selection), level=Qgis.Warning); return
 
 
-        quoted_field_name = f'"{field_name_for_selection}"' # QGIS expression-friendly field name
+        quoted_field_name = QgsExpression.quotedColumnRef(field_name_for_selection) # QGIS expression-friendly field name
         expression = None
         ids_to_select_directly = None
 
@@ -1157,8 +794,12 @@ class FieldProfilerDockWidget(QDockWidget):
             if actual_first_value is None:
                  expression = f"{quoted_field_name} IS NULL" # Select NULLs if the top unique value was NULL
             elif isinstance(actual_first_value, str):
-                escaped_val = actual_first_value.replace("'", "''") # Escape single quotes for SQL-like expression
-                expression = f"{quoted_field_name} = '{escaped_val}'"
+                if hasattr(QgsExpression, 'quotedValue'):
+                    expression = f"{quoted_field_name} = {QgsExpression.quotedValue(actual_first_value)}"
+                else: 
+                     # Fallback for very old QGIS versions (pre-3.0 usually, but safe to have)
+                    escaped_val = actual_first_value.replace("'", "''") 
+                    expression = f"{quoted_field_name} = '{escaped_val}'"
             elif isinstance(actual_first_value, (int, float, numpy.number)): 
                 if numpy.isnan(actual_first_value): 
                     # Selecting NaN by direct equality in QGIS expressions is tricky.
@@ -1168,7 +809,10 @@ class FieldProfilerDockWidget(QDockWidget):
                 expression = f"{quoted_field_name} = {float(actual_first_value)}" # Ensure it's a Python float
             elif isinstance(actual_first_value, QDate):
                 # QGIS expression functions for date/datetime: date('YYYY-MM-DD'), datetime('YYYY-MM-DD HH:MM:SS')
-                expression = f"{quoted_field_name} = date('{actual_first_value.toString(Qt.ISODate)}')"
+                if hasattr(QgsExpression, 'quotedValue'):
+                    expression = f"{quoted_field_name} = {QgsExpression.quotedValue(actual_first_value)}"
+                else:
+                    expression = f"{quoted_field_name} = date('{actual_first_value.toString(Qt.ISODate)}')"
             elif isinstance(actual_first_value, QDateTime):
                 # For QDateTime, QGIS expressions expect ISO format, potentially with time.
                 # Qt.ISODate produces YYYY-MM-DDTHH:MM:SS
@@ -1177,7 +821,11 @@ class FieldProfilerDockWidget(QDockWidget):
                 iso_string = actual_first_value.toString(Qt.ISODate) # e.g., "2023-10-26T10:30:00"
                 # QGIS might prefer space separator for datetime()
                 # expression_dt_string = actual_first_value.toString("yyyy-MM-dd HH:mm:ss.zzz") # More QGIS friendly
-                expression = f"{quoted_field_name} = datetime('{iso_string}')"
+                if hasattr(QgsExpression, 'quotedValue'):
+                    expression = f"{quoted_field_name} = {QgsExpression.quotedValue(actual_first_value)}"
+                else:
+                    iso_string = actual_first_value.toString(Qt.ISODate) 
+                    expression = f"{quoted_field_name} = datetime('{iso_string}')"
 
             else:
                 self.iface.messageBar().pushMessage(self.tr("Warning"), self.tr("Cannot select unique value of type: {0}. Selection for this type is not implemented.").format(type(actual_first_value).__name__), level=Qgis.Warning); return
@@ -1317,6 +965,100 @@ class FieldProfilerDockWidget(QDockWidget):
         except Exception as e: 
             self.iface.messageBar().pushMessage(self.tr("Error"), self.tr("Could not export results to CSV: ") + str(e), level=Qgis.Critical)
             print(f"CSV Export Error: {e}") # Log to console for debugging
+
+
+    def export_results_to_html(self):
+        if not self.analysis_results_cache:
+            self.iface.messageBar().pushMessage(self.tr("Warning"), self.tr("No analysis results to export."), level=Qgis.Warning)
+            return
+
+        filename, filter = QFileDialog.getSaveFileName(self, self.tr("Export HTML Report"), "", self.tr("HTML Files (*.html)"))
+        if not filename: return
+        
+        if not filename.lower().endswith('.html'): filename += '.html'
+        
+        try:
+            current_layer = self.layerComboBox.currentLayer()
+            layer_name = current_layer.name() if current_layer else "Unknown Layer"
+            
+            # Prepare data
+            # Check for correlation matrix in the table widget? 
+            # Or assume we need to pass it differently?
+            # It was removed from results cache in on_analysis_finished! 
+            # We need to store it if we want to export it.
+            # TODO: Fix storage of correlation matrix.
+            # Quick fix: Retrieve from cache if I modify logic to keep it there with a hidden key?
+            # Or just check if I saved it anywhere. 
+            # In on_analysis_finished I deleted it: del results['_global_correlation']
+            # BAD IDEA if I want updates later.
+            # I should store it in self.latest_correlation_matrix
+            
+            generator = ReportGenerator(layer_name)
+            html_content = generator.generate_report(self.analysis_results_cache, getattr(self, 'latest_correlation_matrix', None))
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+                
+            self.iface.messageBar().pushMessage(self.tr("Success"), self.tr("Report exported successfully."), level=Qgis.Success)
+            
+        except Exception as e:
+             self.iface.messageBar().pushMessage(self.tr("Error"), self.tr("Could not export HTML: ") + str(e), level=Qgis.Critical)
+
+    def update_charts(self):
+        if not MATPLOTLIB_AVAILABLE or not self.canvas: return
+        
+        selected_items = self.resultsTableWidget.selectedItems()
+        if not selected_items: return
+    
+        # Determine which column is selected (to know which field)
+        # Assuming single selection or based on first selected item
+        col = selected_items[0].column()
+        if col == 0: return # Statistic label column
+        
+        field_header = self.resultsTableWidget.horizontalHeaderItem(col)
+        if not field_header: return
+        
+        field_name = field_header.text()
+        field_data = self.analysis_results_cache.get(field_name)
+        if not field_data: return
+        
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        
+        # 1. Numeric Histogram
+        if '_histogram_data' in field_data:
+            hist_counts, bin_edges = field_data['_histogram_data']
+            # Plot histogram bar
+            width = numpy.diff(bin_edges)
+            ax.bar(bin_edges[:-1], hist_counts, width=width, align='edge', alpha=0.7)
+            ax.set_title(f"Histogram: {field_name}")
+            ax.set_xlabel("Value")
+            ax.set_ylabel("Frequency")
+            self.chart_info_label.setText(f"Displaying Histogram for numeric field: {field_name}")
+            
+        # 2. Categorical Bar Chart
+        elif '_top_values_raw' in field_data:
+            top_vals = field_data['_top_values_raw']
+            if top_vals:
+                labels = [str(v[0])[:15] for v in top_vals] # Truncate long labels
+                counts = [v[1] for v in top_vals]
+                # Reverse to have highest on top if simple h-bar, or just normal bar
+                x_pos = range(len(labels))
+                ax.bar(x_pos, counts, align='center', alpha=0.7)
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels(labels, rotation=45, ha='right')
+                ax.set_title(f"Top Values: {field_name}")
+                ax.set_ylabel("Count")
+                self.figure.tight_layout() # Fix label cutoff
+                self.chart_info_label.setText(f"Displaying Bar Chart for text field: {field_name}")
+            else:
+                 ax.text(0.5, 0.5, "No data for chart", ha='center', va='center')
+        
+        else:
+             ax.text(0.5, 0.5, "No chart available for this field type", ha='center', va='center')
+             self.chart_info_label.setText(f"No specific chart for field: {field_name}")
+
+        self.canvas.draw()
 
     def closeEvent(self, event):
         # Store settings on close? (e.g., self.iface.pluginVsSettings().setValue(...))

@@ -25,11 +25,8 @@ from qgis.PyQt.QtWidgets import QAction, QToolBar
 from qgis.PyQt.QtCore import Qt, QCoreApplication
 import os.path
 
-from qgis.PyQt.QtCore import Qt, QCoreApplication
-import os.path
-
 from .field_profiler_dockwidget import FieldProfilerDockWidget
-from qgis.core import Qgis
+from qgis.core import Qgis, QgsMessageLog
 
 class FieldProfilerPlugin:
     def __init__(self, iface):
@@ -76,8 +73,7 @@ class FieldProfilerPlugin:
         self.actions.append(self.action)
 
 
-        self.action.setShortcut(QKeySequence("Ctrl+Alt+Shift+P"))
-        print("DEBUG: Field Profiler shortcut Ctrl+Alt+Shift+P set.")  
+        self.action.setShortcut(QKeySequence("Ctrl+Alt+Shift+P"))  
 
         if self.first_run:
             if self.dockwidget is None:
@@ -113,12 +109,9 @@ class FieldProfilerPlugin:
         self.action = None
         self.first_run = True
 
-        print("DEBUG: Field Profiler unloaded.")
-
     def run(self):
         """Run method that loads and shows the dockwidget."""
         if self.dockwidget is None:
-            print("DEBUG: Creating FieldProfilerDockWidget instance.")
 
             self.dockwidget = FieldProfilerDockWidget(self.iface, self.iface.mainWindow())
 
@@ -128,10 +121,8 @@ class FieldProfilerPlugin:
                  self.dockwidget.raise_()
                  self.dockwidget.activateWindow()
              else:
-                 print("DEBUG: Hiding dock widget.")
                  self.dockwidget.close()
         else:
-             print("DEBUG: Showing dock widget.")
              self.dockwidget.show()
              self.dockwidget.raise_()
              self.dockwidget.activateWindow()
