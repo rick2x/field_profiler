@@ -469,6 +469,68 @@ class AnalysisResultsDialog(QDialog):
              else:
                  if self.iface: self.iface.messageBar().pushMessage(self.tr("Selection Info"), self.tr("Q1, Q3, or IQR is N/A or invalid for outlier selection."), level=Qgis.Info); return
 
+        elif original_statistic_key in ['Min Length', 'Max Length'] and is_string_field:
+            target_len = self.analysis_results_cache.get(field_name_for_selection, {}).get(original_statistic_key)
+            if isinstance(target_len, (int, float)):
+                 expression = f"length({quoted_field_name}) = {int(target_len)}"
+            else:
+                 if self.iface: self.iface.messageBar().pushMessage(self.tr("Selection Info"), self.tr("Length statistic not available."), level=Qgis.Info); return
+
+        elif original_statistic_key in ['Min', 'Max'] and is_numeric_field:
+             val = self.analysis_results_cache.get(field_name_for_selection, {}).get(original_statistic_key)
+             if isinstance(val, (int, float, numpy.number)) and not numpy.isnan(val):
+                  expression = f"{quoted_field_name} = {float(val)}"
+             else:
+                  if self.iface: self.iface.messageBar().pushMessage(self.tr("Selection Info"), self.tr("Value not available for selection."), level=Qgis.Info); return
+
+        elif original_statistic_key in ['Min Date', 'Max Date']:
+             val_str = self.analysis_results_cache.get(field_name_for_selection, {}).get(original_statistic_key)
+             if val_str and isinstance(val_str, str):
+                  if field_qobj.type() == QVariant.Date:
+                       expression = f"{quoted_field_name} = date('{val_str}')"
+                  elif field_qobj.type() == QVariant.DateTime:
+                       expression = f"{quoted_field_name} = datetime('{val_str}')"
+                  else:
+                       expression = f"{quoted_field_name} = '{val_str}'"
+             else:
+                  if self.iface: self.iface.messageBar().pushMessage(self.tr("Selection Info"), self.tr("Date value not available."), level=Qgis.Info); return
+
+        elif original_statistic_key == 'Zeros' and is_numeric_field:
+             expression = f"{quoted_field_name} = 0"
+        elif original_statistic_key == 'Positives' and is_numeric_field:
+             expression = f"{quoted_field_name} > 0"
+        elif original_statistic_key == 'Negatives' and is_numeric_field:
+             expression = f"{quoted_field_name} < 0"
+        
+        elif original_statistic_key in ['Min Outlier', 'Max Outlier'] and is_numeric_field:
+             val = self.analysis_results_cache.get(field_name_for_selection, {}).get(original_statistic_key)
+             if isinstance(val, (int, float, numpy.number)) and not numpy.isnan(val):
+                  expression = f"{quoted_field_name} = {float(val)}"
+             else:
+                  if self.iface: self.iface.messageBar().pushMessage(self.tr("Selection Info"), self.tr("Outlier value n/a."), level=Qgis.Info); return
+
+        elif original_statistic_key in ['Dates Before Today', 'Dates After Today']:
+             # We can use QGIS 'now()' function for robust comparison
+             op = '<' if 'Before' in original_statistic_key else '>'
+             if field_qobj.type() == QVariant.Date:
+                  expression = f"{quoted_field_name} {op} to_date(now())"
+             elif field_qobj.type() == QVariant.DateTime:
+                  expression = f"{quoted_field_name} {op} now()"
+             else:
+                  # Fallback for string dates? Might result in string comparison which is risky but maybe what user wants if they have string dates
+                  # field_profiler_task uses python datetime.now().date() for calc.
+                  # Let's rely on QGIS now() which is consistent.
+                  # But wait, 'now()' includes time. 'Dates Before Today' usually means strictly before today's date (at 00:00:00).
+                  # Task logic: d.date() < today.
+                  # QGIS logic equivalent: 
+                  # Before Today: "date_column" < to_date(now())
+                  # After Today: "date_column" > to_date(now())  (Wait, if today is 2023-10-27, after today is 2023-10-28+?)
+                  # Task logic: d.date() > today. So yes, strictly future days.
+                  expression = f"to_date({quoted_field_name}) {op} to_date(now())" 
+             
+             if not expression:
+                   if self.iface: self.iface.messageBar().pushMessage(self.tr("Selection Info"), self.tr("Date selection not supported for this field type."), level=Qgis.Info); return
+
         elif original_statistic_key == 'Unique Values (Top)':
             cached_field_results = self.analysis_results_cache.get(field_name_for_selection, {})
             actual_first_value = cached_field_results.get('Unique Values (Top)_actual_first_value')
@@ -520,13 +582,6 @@ class AnalysisResultsDialog(QDialog):
             num_selected = layer.selectByExpression(expression_string, selection_mode)
             if self.iface: self.iface.mapCanvas().refresh()
             
-            # Attributes table sync attempt
-            if self.iface and self.iface.attributesToolBar() and self.iface.attributesToolBar().isVisible():
-                 for table_view in self.iface.mainWindow().findChildren(QgsAttributeTable):
-                    if table_view.layer() == layer:
-                        table_view.doSelect(layer.selectedFeatureIds())
-                        break
-            
             msg = self.tr("Selected {0} features for field '{1}' where: {2}").format(num_selected, field_name, expression_string)
             if self.was_analyzing_selected_features and selection_mode == QgsVectorLayer.IntersectSelection:
                  msg += self.tr(" (Intersected with current layer selection).")
@@ -557,12 +612,6 @@ class AnalysisResultsDialog(QDialog):
                 msg_suffix = "."
             
             if self.iface: self.iface.mapCanvas().refresh()
-            
-            if self.iface and self.iface.attributesToolBar() and self.iface.attributesToolBar().isVisible():
-                 for table_view in self.iface.mainWindow().findChildren(QgsAttributeTable):
-                    if table_view.layer() == layer:
-                        table_view.doSelect(layer.selectedFeatureIds())
-                        break
             
             msg = self.tr("Selected {0} features for field '{1}' based on stored IDs{2}").format(num_selected, field_name, msg_suffix)
             if self.iface: self.iface.messageBar().pushMessage(self.tr("Selection Succeeded"), msg, level=Qgis.Success, duration=7)
